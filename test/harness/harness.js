@@ -3,7 +3,6 @@ import * as THREE from 'three';
 import { parseVrm, prepareLegsModel, reshapeLegs, measureThighRatio, bakeLegTexture, applyCulling, AvatarInstance } from '../../src/renderer/lib/avatar.js';
 import { applyPose, solvePlacement, placeModel } from '../../src/renderer/lib/retarget.js';
 import { MotionRecorder } from '../../src/renderer/lib/recorder.js';
-import { BUILTIN_BOTTOMS, chooseBottoms } from '../../src/renderer/lib/bottoms.js';
 import { classifyLegwear } from '../../src/renderer/lib/features.js';
 
 function syntheticPose(yaw, t) {
@@ -49,14 +48,13 @@ window.runTest = async (url, mode) => {
     avatar = new AvatarInstance(vrm, 1);
     const lw = classifyLegwear([1, 1, 1, 1, 0, 0, 0, 0, 1, 1], false, 9, [40, 60, 120]);
     out.legwear = lw;
-    const pick = chooseBottoms(lw, BUILTIN_BOTTOMS);
-    out.pick = pick;
+    // Stand-in for a UV-mapped bottoms texture: opaque over the lower half of
+    // the UV space, transparent elsewhere, with some shading to recolour.
+    const tex = document.createElement('canvas'); tex.width = tex.height = 512;
+    const tctx = tex.getContext('2d');
+    for (let y = 256; y < 512; y += 8) { tctx.fillStyle = y % 16 ? '#999' : '#bbb'; tctx.fillRect(0, y, 512, 8); }
     const t0 = performance.now();
-    bakeLegTexture(skinMeshes, {
-      skin: [140, 95, 70],
-      bottom: { item: BUILTIN_BOTTOMS.find((b) => b.id === pick.bottomId), color: [40, 60, 120], hem: lw.hem },
-      legwear: pick.legwearId ? { item: BUILTIN_BOTTOMS.find((b) => b.id === pick.legwearId), color: [240, 240, 240], top: lw.socksTop } : null,
-    }, avatar.rest);
+    bakeLegTexture(skinMeshes, { skin: [140, 95, 70], layers: [{ image: tex, color: [40, 60, 120] }] }, avatar.rest);
     out.bakeMs = performance.now() - t0;
     out.visibleMeshes = [];
     vrm.scene.traverse((o) => { if (o.isMesh && o.visible) out.visibleMeshes.push(o.name + ':' + (o.geometry.index ? o.geometry.index.count : 0)); });

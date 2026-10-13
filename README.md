@@ -19,7 +19,7 @@ Pick a **base VRoid model** (`.vrm` exported from VRoid Studio). For every detec
 1. Loads the full VRoid skeleton but **shows only the waist-down** part of the mesh. The face, hair, upper body and (optionally) the base model's own clothing are removed.
 2. **Matches skin colour** by sampling the character's face and tinting the body texture.
 3. **Matches leg proportions**: thigh and shin length relative to the torso, and thigh thickness when a segmentation mask is available. The legs are reshaped in the rest pose and re-bound, so they still bend cleanly.
-4. **Classifies the leg wear** (pants, capris, shorts, short shorts, skirt, mini, midi, long skirt, socks, knee socks or thigh-highs). It picks a matching item from the **bottoms library**, tinted with the average colour the character is wearing, and bakes it onto the body texture.
+4. **Classifies the leg wear** (pants, capris, shorts, short shorts, skirt, mini, midi, long skirt, socks, knee socks or thigh-highs). It picks the matching texture from **your bottoms folder**, recolours it with the average colour the character is wearing, and lays it over the skin texture using the model's UV layout.
 5. Saves a **character key** built from skin tone, hair colour and length, top colour, bottom colour and leg-wear type, together with the bottoms that were chosen. When the same character returns (even after leaving the screen), it gets the same legs.
 6. Counts **how often each character is loaded**. The menu lists every save with its load count. You can delete selected saves, or use **Clean up** to remove all saves loaded fewer than N times.
 
@@ -53,34 +53,35 @@ Tips:
 - **Show detected skeleton** draws the detected landmarks, which helps when tuning.
 - Use **Lite** detection for speed and **Heavy** for accuracy.
 
-## Bottoms library
+## Bottoms textures
 
-The built-in library covers jeans, slacks, leggings, plaid pants, sheer tights, capris, shorts, denim shorts, bike shorts, short shorts, pleated and plaid skirts, mini, midi and long skirts, briefs, socks, knee socks and thigh-highs. Patterns are procedural (denim, knit, ribbed, pleats, plaid, sheer).
+There are no built-in bottoms; you supply them. Click **Open folder** in the menu to open `%APPDATA%\Vibecatcher\bottoms`, drop your PNG textures in, then click **Reload**.
 
-You can add your own items. **Open folder** in the menu opens `%APPDATA%\Vibecatcher\bottoms`. Put one JSON file per item there, plus an optional tileable greyscale PNG:
+Each texture must be **UV-mapped to the VRoid body texture** (the same layout as the base model's `Body_00_SKIN` texture). Transparent pixels show the skin; opaque pixels cover it. The texture is laid over the skin texture pixel for pixel, scaled to the skin texture's size if the resolution differs.
 
-```json
-{
-  "id": "cargo-shorts",
-  "name": "Cargo shorts",
-  "category": "shorts",
-  "layer": "bottom",
-  "top": -0.3,
-  "hem": "auto",
-  "pattern": "image",
-  "image": "cargo.png",
-  "scale": 1,
-  "opacity": 1,
-  "waistband": true,
-  "cuff": true
-}
+The **file name** says what kind of leg wear it is:
+
+```
+<category>.png        or        <category>_<anything>.png
 ```
 
-- `category`: `pants`, `capris`, `shorts`, `short-shorts`, `skirt`, `mini-skirt`, `midi-skirt`, `long-skirt`, `none`; or, for `"layer": "legwear"`, `socks`, `knee-socks`, `thigh-highs`.
-- `top` and `hem` are positions along the leg: `-0.35` = waist, `0` = hip joint, `0.5` = knee, `1` = ankle, `1.15` = sole. `"auto"` uses the length measured on the character.
-- `pattern`: `plain`, `denim`, `knit`, `ribbed`, `pleats`, `plaid`, `sheer`, or `image`, which uses the PNG as a detail map. The colour always comes from the character.
+| Category | Used when the character wears |
+|---|---|
+| `pants` | full-length trousers, jeans, leggings |
+| `capris` | trousers ending between knee and ankle |
+| `shorts` | shorts ending around mid-thigh to knee |
+| `short-shorts` | very short shorts |
+| `skirt`, `mini-skirt`, `midi-skirt`, `long-skirt` | skirts of each length |
+| `none` | bare legs (e.g. underwear / briefs) |
+| `socks`, `knee-socks`, `thigh-highs` | socks; layered on top of the bottom |
 
-An item whose `id` matches a built-in item replaces it.
+Examples: `pants_jeans.png`, `pants_denim.png`, `shorts.png`, `skirt_pleated.png`, `mini-skirt_plaid.png`, `thigh-highs_white.png`.
+
+- If you have several textures in a category, words in the `<anything>` part help pick one. Use `denim` / `jean` for denim-looking clothes, `plaid` / `check` / `print` / `pleat` for patterned ones, and `plain` / `solid` for flat colours. Otherwise the first file alphabetically is used.
+- If a category has no texture, the closest one is used (for example `skirt` for a mini skirt). If the folder is empty, only the skin is shown.
+- Textures are **recoloured** with the character's clothing colour, keeping the texture's own shading. Put `notint` in the name (e.g. `shorts_camo_notint.png`) to keep its original colours.
+- Files whose names don't start with a category are ignored, and the menu lists them.
+- Each saved character remembers the texture file it was given. If you delete or rename that file, the character is re-assigned the closest texture you have.
 
 ## Where data is stored
 

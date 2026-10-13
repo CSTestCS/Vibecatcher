@@ -4,7 +4,6 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 import { RigInfo } from './retarget.js';
-import { PATTERNS } from './bottoms.js';
 
 const loader = new GLTFLoader();
 loader.register((parser) => new VRMLoaderPlugin(parser));
@@ -283,8 +282,13 @@ function makeCanvasTexture(canvas, like) {
 }
 
 /**
- * Bakes skin tone + chosen bottoms onto the body-skin texture.
- * @param {object} look { skin:[r,g,b]|null, bottom:{item,color,hem}|null, legwear:{item,color,top}|null, patterns }
+ * Bakes the skin tone and the chosen bottom textures onto the body-skin
+ * texture. The library textures share the VRoid body texture's UV layout, so
+ * they are simply composited over the skin pixel for pixel (using their alpha).
+ * @param {object} look {
+ *   skin: [r,g,b] | null,
+ *   layers: [{ image: HTMLImageElement, color: [r,g,b] | null }]  (bottom first, then socks)
+ * }
  */
 export function bakeLegTexture(skinMeshes, look, rest) {
   const meshes = findSkinMeshes(skinMeshes);
@@ -302,56 +306,39 @@ export function bakeLegTexture(skinMeshes, look, rest) {
     const { canvas, ctx, data } = textureImageData(tex.userData.vibeOriginal);
     const W = data.width, H = data.height, px = data.data;
 
-    // Per-vertex leg parameter and around-limb angle (rest pose, world space).
-    const tris = [];
-    const refSkin = [];
-    for (const m of ms) {
-      const g = m.geometry;
-      const pos = g.attributes.position, uv = g.attributes.uv;
-      if (!uv || !g.index) continue;
-      const n = pos.count;
-      const L = new Float32Array(n), C = new Float32Array(n), Sn = new Float32Array(n);
+    // 1) skin tone: multiply the skin texture towards the target colour. The
+    //    reference tone is read from the texture where the thighs/shins are.
+    if (look.skin) {
+      const refSkin = [];
       const v = new THREE.Vector3();
-      for (let i = 0; i < n; i++) {
-        v.fromBufferAttribute(pos, i).applyMatrix4(rest.meshMatrix.get(m) || m.matrixWorld);
-        const side = (v.x - frame.center.x) * (frame.L.hip.x - frame.center.x) >= 0 ? frame.L : frame.R;
-        const l = legParam(v.y, side);
-        const ax = l < 0 ? frame.center : axisAt(v.y, side);
-        const a = Math.atan2(v.z - ax.z, v.x - ax.x);
-        L[i] = l; C[i] = Math.cos(a); Sn[i] = Math.sin(a);
-      }
-      const idx = g.index.array;
-      const count = g.groups.length ? g.groups[0].count : idx.length;
-      const start = g.groups.length ? g.groups[0].start : 0;
-      for (let i = start; i < start + count; i += 3) {
-        const t = [idx[i], idx[i + 1], idx[i + 2]].map((k) => ({
-          x: uv.getX(k) * W, y: uv.getY(k) * H, l: L[k], c: C[k], s: Sn[k],
-        }));
-        tris.push(t);
-        if (t[0].l > 0.1 && t[0].l < 0.9 && refSkin.length < 4000) {
-          const x = Math.floor(((t[0].x % W) + W) % W), y = Math.floor(((t[0].y % H) + H) % H);
+      for (const m of ms) {
+        const g = m.geometry;
+        const pos = g.attributes.position, uv = g.attributes.uv;
+        if (!uv) continue;
+        const mw = rest.meshMatrix.get(m) || m.matrixWorld;
+        for (let i = 0; i < pos.count && refSkin.length < 4000; i += 3) {
+          v.fromBufferAttribute(pos, i).applyMatrix4(mw);
+          const side = (v.x - frame.center.x) * (frame.L.hip.x - frame.center.x) >= 0 ? frame.L : frame.R;
+          const l = legParam(v.y, side);
+          if (l < 0.1 || l > 0.9) continue;
+          const x = Math.floor(((uv.getX(i) % 1) + 1) % 1 * W), y = Math.floor(((uv.getY(i) % 1) + 1) % 1 * H);
           const o = (y * W + x) * 4;
           refSkin.push([px[o], px[o + 1], px[o + 2]]);
         }
       }
-    }
-
-    // 1) skin tone: multiply the whole skin texture towards the target colour.
-    if (look.skin && refSkin.length) {
-      const med = [0, 1, 2].map((k) => refSkin.map((c) => c[k]).sort((a, b) => a - b)[Math.floor(refSkin.length / 2)]);
-      const gain = med.map((m, k) => THREE.MathUtils.clamp(look.skin[k] / Math.max(8, m), 0.25, 2.5));
-      for (let i = 0; i < px.length; i += 4) {
-        px[i] = Math.min(255, px[i] * gain[0]);
-        px[i + 1] = Math.min(255, px[i + 1] * gain[1]);
-        px[i + 2] = Math.min(255, px[i + 2] * gain[2]);
+      if (refSkin.length) {
+        const med = [0, 1, 2].map((k) => refSkin.map((c) => c[k]).sort((a, b) => a - b)[Math.floor(refSkin.length / 2)]);
+        const gain = med.map((m, k) => THREE.MathUtils.clamp(look.skin[k] / Math.max(8, m), 0.25, 2.5));
+        for (let i = 0; i < px.length; i += 4) {
+          px[i] = Math.min(255, px[i] * gain[0]);
+          px[i + 1] = Math.min(255, px[i + 1] * gain[1]);
+          px[i + 2] = Math.min(255, px[i + 2] * gain[2]);
+        }
       }
     }
 
-    // 2) clothing layers rasterised in UV space.
-    const layers = [];
-    if (look.bottom && look.bottom.item) layers.push(layerSpec(look.bottom, 'bottom', look.patterns));
-    if (look.legwear && look.legwear.item) layers.push(layerSpec(look.legwear, 'legwear', look.patterns));
-    if (layers.length) rasterize(tris, W, H, px, layers);
+    // 2) clothing textures composited in UV space.
+    for (const layer of look.layers || []) compositeLayer(px, W, H, layer);
 
     ctx.putImageData(data, 0, 0);
     const baked = makeCanvasTexture(canvas, tex.userData.vibeOriginal);
@@ -360,65 +347,44 @@ export function bakeLegTexture(skinMeshes, look, rest) {
       const mats = Array.isArray(m.material) ? m.material : [m.material];
       for (const mat of mats) {
         if (mat.map === tex) mat.map = baked;
-        if (mat.shadeMultiplyTexture && (mat.shadeMultiplyTexture === tex || mat.shadeMultiplyTexture.userData.vibeShadeOf === tex)) {
-          mat.shadeMultiplyTexture = baked;
-        }
+        if (mat.shadeMultiplyTexture && mat.shadeMultiplyTexture === tex) mat.shadeMultiplyTexture = baked;
       }
     }
   }
 }
 
-function layerSpec(layer, kind, patterns) {
-  const it = layer.item;
-  let top = it.top, hem = it.hem;
-  if (kind === 'bottom' && hem === 'auto') hem = THREE.MathUtils.clamp((layer.hem ?? 0.5) + 0.02, 0.05, 1.05);
-  if (kind === 'legwear' && top === 'auto') top = THREE.MathUtils.clamp(layer.top ?? 0.75, 0.1, 1.0);
-  const fn = it.pattern === 'image' ? (patterns && patterns[it.id]) || PATTERNS.plain : PATTERNS[it.pattern] || PATTERNS.plain;
-  return {
-    top, hem, color: layer.color, fn, scale: it.scale || 1, opacity: it.opacity ?? 1,
-    sheer: it.pattern === 'sheer', waistband: !!it.waistband, cuff: !!it.cuff,
-  };
-}
-
-function rasterize(tris, W, H, px, layers) {
-  const edge = 0.012;
-  for (const t of tris) {
-    const [a, b, c] = t;
-    const minX = Math.max(0, Math.floor(Math.min(a.x, b.x, c.x) - 1));
-    const maxX = Math.min(W - 1, Math.ceil(Math.max(a.x, b.x, c.x) + 1));
-    const minY = Math.max(0, Math.floor(Math.min(a.y, b.y, c.y) - 1));
-    const maxY = Math.min(H - 1, Math.ceil(Math.max(a.y, b.y, c.y) + 1));
-    const area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-    if (Math.abs(area) < 1e-6 || maxX - minX > W / 2 || maxY - minY > H / 2) continue;
-    const lmin = Math.min(a.l, b.l, c.l), lmax = Math.max(a.l, b.l, c.l);
-    if (!layers.some((ly) => lmax >= ly.top - edge && lmin <= ly.hem + edge)) continue;
-    // ~1px conservative expansion to avoid seams
-    const tol = 1.2 / Math.sqrt(Math.abs(area));
-    for (let y = minY; y <= maxY; y++) {
-      for (let x = minX; x <= maxX; x++) {
-        const qx = x + 0.5, qy = y + 0.5;
-        const w0 = ((b.x - qx) * (c.y - qy) - (b.y - qy) * (c.x - qx)) / area;
-        const w1 = ((c.x - qx) * (a.y - qy) - (c.y - qy) * (a.x - qx)) / area;
-        const w2 = 1 - w0 - w1;
-        if (w0 < -tol || w1 < -tol || w2 < -tol) continue;
-        const l = a.l * w0 + b.l * w1 + c.l * w2;
-        const u = (Math.atan2(a.s * w0 + b.s * w1 + c.s * w2, a.c * w0 + b.c * w1 + c.c * w2) / (Math.PI * 2)) + 0.5;
-        const o = (y * W + x) * 4;
-        for (const ly of layers) {
-          const cov = THREE.MathUtils.smoothstep(l, ly.top - edge, ly.top + edge) * (1 - THREE.MathUtils.smoothstep(l, ly.hem - edge, ly.hem + edge));
-          if (cov <= 0) continue;
-          let shade = ly.fn(u * ly.scale, l * ly.scale);
-          if (ly.waistband && l < ly.top + 0.045) shade *= 0.82;
-          if (ly.cuff && l > ly.hem - 0.035) shade *= 0.88;
-          const k = cov * ly.opacity;
-          for (let ch = 0; ch < 3; ch++) {
-            const base = px[o + ch];
-            const fab = ly.sheer ? base * (ly.color[ch] / 255) * 1.1 * shade : ly.color[ch] * shade;
-            px[o + ch] = Math.max(0, Math.min(255, base + (fab - base) * k));
-          }
-        }
-      }
+/**
+ * Lays one UV-mapped clothing texture over the skin pixels. When `color` is
+ * given the texture is recoloured: its shading (luminance relative to its
+ * average) is kept and multiplied by the character's clothing colour.
+ */
+function compositeLayer(px, W, H, { image, color }) {
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(image, 0, 0, W, H);
+  const src = ctx.getImageData(0, 0, W, H).data;
+  let meanL = 1;
+  if (color) {
+    let sum = 0, n = 0;
+    for (let i = 0; i < src.length; i += 4) {
+      if (src[i + 3] < 128) continue;
+      sum += src[i] * 0.2126 + src[i + 1] * 0.7152 + src[i + 2] * 0.0722;
+      n++;
     }
+    meanL = n ? Math.max(1, sum / n) : 1;
+  }
+  for (let i = 0; i < src.length; i += 4) {
+    const a = src[i + 3] / 255;
+    if (a <= 0) continue;
+    let r = src[i], g = src[i + 1], b = src[i + 2];
+    if (color) {
+      const shade = (r * 0.2126 + g * 0.7152 + b * 0.0722) / meanL;
+      r = color[0] * shade; g = color[1] * shade; b = color[2] * shade;
+    }
+    px[i] = Math.min(255, px[i] + (r - px[i]) * a);
+    px[i + 1] = Math.min(255, px[i + 1] + (g - px[i + 1]) * a);
+    px[i + 2] = Math.min(255, px[i + 2] + (b - px[i + 2]) * a);
   }
 }
 

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildAnimationFbx } from '../src/renderer/lib/fbx.js';
 import { classifyLegwear, appearanceDistance } from '../src/renderer/lib/features.js';
-import { BUILTIN_BOTTOMS, chooseBottoms } from '../src/renderer/lib/bottoms.js';
+import { parseBottomFile, chooseBottoms } from '../src/renderer/lib/bottoms.js';
 import { appearanceKey } from '../src/renderer/lib/characters.js';
 
 // Walks the binary FBX node tree and checks every record's offsets.
@@ -91,11 +91,27 @@ test('leg-wear classification', () => {
   assert.ok(socks.socksTop > 0.6 && socks.socksTop < 0.8);
 });
 
-test('bottom selection prefers a matching pattern and adds socks', () => {
+test('bottom texture names are parsed into categories', () => {
+  assert.equal(parseBottomFile('pants_jeans.png').category, 'pants');
+  assert.equal(parseBottomFile('Short-Shorts_Denim.PNG').category, 'short-shorts');
+  assert.equal(parseBottomFile('mini-skirt.png').category, 'mini-skirt');
+  assert.equal(parseBottomFile('skirt_pleated.png').category, 'skirt');
+  assert.equal(parseBottomFile('thigh-highs_white.png').layer, 'legwear');
+  assert.equal(parseBottomFile('shorts_red_notint.png').tint, false);
+  assert.equal(parseBottomFile('shorts.png').tint, true);
+  assert.equal(parseBottomFile('shortsy.png'), null);
+  assert.equal(parseBottomFile('hat.png'), null);
+  assert.equal(parseBottomFile('pants.jpg'), null);
+});
+
+test('bottom selection uses the user textures, with hints and fallbacks', () => {
+  const lib = ['shorts_plain.png', 'shorts_denim.png', 'skirt.png', 'knee-socks.png'].map(parseBottomFile);
   const lw = { category: 'shorts', hem: 0.4, socksTop: 0.3, skirt: false, texture: 9, denimLike: true };
-  const pick = chooseBottoms(lw, BUILTIN_BOTTOMS);
-  assert.equal(pick.bottomId, 'denim-shorts');
-  assert.equal(pick.legwearId, 'thigh-highs');
+  const pick = chooseBottoms(lw, lib);
+  assert.equal(pick.bottomId, 'shorts_denim.png');
+  assert.equal(pick.legwearId, 'knee-socks.png'); // no thigh-highs texture -> nearest kind
+  assert.equal(chooseBottoms({ ...lw, category: 'mini-skirt', socksTop: null }, lib).bottomId, 'skirt.png');
+  assert.deepEqual(chooseBottoms(lw, []), { bottomId: null, legwearId: null });
 });
 
 test('appearance keys are stable and distances are symmetric', () => {

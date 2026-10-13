@@ -9,7 +9,7 @@ import { CharacterStore } from './lib/characters.js';
 import {
   FrameSampler, extractAppearance, extractProportions, estimateLighting, averageAppearance, LM,
 } from './lib/features.js';
-import { BUILTIN_BOTTOMS, chooseBottoms, loadImagePattern } from './lib/bottoms.js';
+import { parseBottomFile, chooseBottoms, loadBottomImage } from './lib/bottoms.js';
 import {
   parseVrm, prepareLegsModel, reshapeLegs, measureThighRatio, bakeLegTexture, applyCulling, AvatarInstance,
 } from './lib/avatar.js';
@@ -38,8 +38,8 @@ const state = {
   avatars: new Map(), // trackId -> AvatarInstance
   pending: new Set(), // trackIds with an avatar being built
   freeLayers: Array.from({ length: 30 }, (_, i) => i + 1),
-  bottoms: [...BUILTIN_BOTTOMS],
-  patterns: {},
+  bottoms: [], // parsed texture files from the bottoms folder
+  bottomImages: new Map(), // file -> Promise<HTMLImageElement>
   frame: 0,
   lastTick: performance.now(),
   fps: 0,
@@ -130,16 +130,35 @@ async function initDetector() {
 // Bottoms library (built-in + user folder)
 // ---------------------------------------------------------------------------
 async function loadBottoms() {
-  const user = await api.listUserBottoms();
-  const valid = user.filter((u) => u.id && u.category);
-  state.bottoms = [...BUILTIN_BOTTOMS.filter((b) => !valid.find((u) => u.id === b.id)), ...valid];
-  for (const u of valid) {
-    if (u.pattern === 'image' && u.image) {
-      try { state.patterns[u.id] = await loadImagePattern(u.image); } catch (e) { console.warn('pattern', u.image, e); }
-    }
-  }
-  document.getElementById('bottoms-count').textContent =
-    `${state.bottoms.length} bottoms (${valid.length} from your folder).`;
+  const files = await api.listUserBottoms();
+  const parsed = files.map(parseBottomFile);
+  state.bottoms = parsed.filter(Boolean);
+  state.bottomImages.clear();
+  const ignored = files.filter((f, i) => !parsed[i]);
+  const el = document.getElementById('bottoms-count');
+  el.textContent = state.bottoms.length
+    ? `${state.bottoms.length} texture${state.bottoms.length === 1 ? '' : 's'}: ${state.bottoms.map((b) => b.file).join(', ')}`
+    : 'No textures yet. Add PNGs named like pants_jeans.png, shorts.png, skirt_pleated.png, thigh-highs.png.';
+  if (ignored.length) el.textContent += ` · ignored (unknown name): ${ignored.join(', ')}`;
+}
+
+function bottomImage(file) {
+  if (!state.bottomImages.has(file)) state.bottomImages.set(file, loadBottomImage(file));
+  return state.bottomImages.get(file);
+}
+
+/** Re-picks a saved character's textures if its files were removed or renamed. */
+function ensureBottoms(c) {
+  const has = (id) => !id || state.bottoms.some((b) => b.id === id);
+  const missingBottom = !c.bottomId || !has(c.bottomId);
+  const missingSocks = !has(c.legwearId) || (!c.legwearId && c.legwear.socksTop != null);
+  if (!missingBottom && !missingSocks) return;
+  const pick = chooseBottoms({ ...c.appearance.legwear, ...c.legwear }, state.bottoms);
+  if (missingBottom) c.bottomId = pick.bottomId;
+  if (missingSocks) c.legwearId = pick.legwearId;
+  const item = state.bottoms.find((b) => b.id === c.bottomId);
+  c.bottomName = item ? item.name : '';
+  state.store.changed();
 }
 
 // ---------------------------------------------------------------------------
@@ -172,14 +191,16 @@ async function buildLegsAvatar(track) {
     if (state.settings.matchProportions && c.proportions) reshapeLegs(vrm, legSets, c.proportions);
     const avatar = new AvatarInstance(vrm, takeLayer());
     if (state.tracker.tracks.find((t) => t.id === track.id) === undefined) { avatar.dispose(); releaseLayer(avatar.layer); return; }
-    const bottomItem = state.bottoms.find((b) => b.id === c.bottomId) || null;
-    const legItem = state.bottoms.find((b) => b.id === c.legwearId) || null;
-    bakeLegTexture(skinMeshes, {
-      skin: state.settings.matchSkin ? c.colors.skin : null,
-      bottom: bottomItem ? { item: bottomItem, color: c.colors.bottom, hem: c.legwear.hem } : null,
-      legwear: legItem ? { item: legItem, color: c.colors.socks || c.colors.bottom, top: c.legwear.socksTop } : null,
-      patterns: state.patterns,
-    }, avatar.rest);
+    ensureBottoms(c);
+    const layers = [];
+    for (const [id, color] of [[c.bottomId, c.colors.bottom], [c.legwearId, c.colors.socks || c.colors.bottom]]) {
+      const item = id && state.bottoms.find((b) => b.id === id);
+      if (!item) continue;
+      try {
+        layers.push({ image: await bottomImage(item.file), color: item.tint ? color : null });
+      } catch (e) { console.warn('bottom texture', item.file, e); }
+    }
+    bakeLegTexture(skinMeshes, { skin: state.settings.matchSkin ? c.colors.skin : null, layers }, avatar.rest);
     applyCulling(vrm, state.settings.backfaceCulling);
     scene.add(avatar.group);
     disposeAvatar(track.id);
@@ -535,9 +556,12 @@ function bindButtons() {
     document.getElementById('mocap-name').textContent = f.name;
     await buildMocapAvatar();
   });
-  document.getElementById('open-bottoms').addEventListener('click', async () => {
-    await api.openBottomsFolder();
-    setTimeout(loadBottoms, 1000);
+  document.getElementById('open-bottoms').addEventListener('click', () => api.openBottomsFolder());
+  document.getElementById('reload-bottoms').addEventListener('click', async () => {
+    await loadBottoms();
+    // rebuild the legs so new / changed textures show up
+    for (const id of [...state.avatars.keys()]) disposeAvatar(id);
+    state.ui.toast('Bottoms library reloaded.');
   });
   document.getElementById('cleanup').addEventListener('click', () => {
     const n = state.store.cleanup(state.settings.cleanupMinLoads);

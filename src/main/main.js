@@ -202,16 +202,12 @@ function registerIpc() {
     return r.filePath;
   }));
 
+  // The bottoms library is just the PNG textures in the folder; the renderer
+  // decides what each one is from its file name.
   ipcMain.handle('bottoms:list', () => {
     const dir = userBottomsDir();
     fs.mkdirSync(dir, { recursive: true });
-    const items = [];
-    for (const f of fs.readdirSync(dir)) {
-      if (!f.toLowerCase().endsWith('.json')) continue;
-      const item = readJSON(path.join(dir, f), null);
-      if (item && item.id) items.push({ ...item, source: 'user', file: f });
-    }
-    return items;
+    return fs.readdirSync(dir).filter((f) => f.toLowerCase().endsWith('.png')).sort();
   });
   ipcMain.handle('bottoms:openFolder', () => {
     fs.mkdirSync(userBottomsDir(), { recursive: true });
