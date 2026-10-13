@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self' vibe:; script-src 'self' vibe: 'wasm-unsafe-eval' 'unsafe-eval'; style-src 'self' vibe: 'unsafe-inline'; img-src 'self' vibe: blob: data:; media-src 'self' vibe: blob: mediastream:; connect-src 'self' vibe: blob: data:; worker-src 'self' vibe: blob:">
+  <title>Vibecatcher</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <canvas id="scene"></canvas>
+  <canvas id="debug"></canvas>
+
+  <div id="gear" title="Click: open settings · Drag: move">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.14 12.94a7.5 7.5 0 0 0 .05-.94 7.5 7.5 0 0 0-.05-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.03 7.03 0 0 0-1.63-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.59.24-1.13.56-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L2.65 8.84a.5.5 0 0 0 .12.64l2.03 1.58a7.5 7.5 0 0 0 0 1.88l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.13.22.39.3.6.22l2.39-.96c.5.38 1.04.7 1.63.94l.36 2.54c.05.24.25.42.5.42h3.84c.25 0 .45-.18.5-.42l.36-2.54c.59-.24 1.13-.56 1.63-.94l2.39.96c.22.08.47 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/></svg>
+    <span id="rec-dot" hidden></span>
+  </div>
+
+  <div id="menu" hidden>
+    <header>
+      <strong>Vibecatcher</strong>
+      <span id="status">starting…</span>
+      <button id="collapse" title="Collapse to gear">–</button>
+    </header>
+
+    <section>
+      <h3>General</h3>
+      <label class="row"><span>Overlay enabled</span><input type="checkbox" data-setting="enabled"></label>
+      <label class="row"><span>Mode</span>
+        <select data-setting="mode">
+          <option value="legs">1 · Legs (waist-down model)</option>
+          <option value="mocap">2 · Motion capture (your VRM)</option>
+        </select>
+      </label>
+      <label class="row"><span>Max characters at once</span><input type="number" min="1" max="8" step="1" data-setting="maxCharacters"></label>
+      <label class="row"><span>Display to watch</span><select data-setting="displayId" id="display-select"></select></label>
+      <label class="row"><span>Detection model</span>
+        <select data-setting="detectionModel">
+          <option value="lite">Lite (fastest)</option>
+          <option value="full">Full</option>
+          <option value="heavy">Heavy (most accurate)</option>
+        </select>
+      </label>
+      <label class="row"><span>Detection confidence <output data-for="minConfidence"></output></span><input type="range" min="0.2" max="0.9" step="0.05" data-setting="minConfidence"></label>
+      <label class="row"><span>Motion smoothing <output data-for="smoothing"></output></span><input type="range" min="0" max="0.95" step="0.05" data-setting="smoothing"></label>
+      <label class="row"><span>Camera FOV (°) <output data-for="cameraFov"></output></span><input type="range" min="20" max="100" step="1" data-setting="cameraFov"></label>
+    </section>
+
+    <section>
+      <h3>Rendering</h3>
+      <label class="row"><span>Back-face culling</span><input type="checkbox" data-setting="backfaceCulling"></label>
+      <label class="row"><span>Match scene lighting</span><input type="checkbox" data-setting="matchLighting"></label>
+      <label class="row"><span>Lighting strength <output data-for="lightingStrength"></output></span><input type="range" min="0.2" max="2" step="0.05" data-setting="lightingStrength"></label>
+      <label class="row"><span>Show detected skeleton</span><input type="checkbox" data-setting="showSkeleton"></label>
+    </section>
+
+    <section data-mode="legs">
+      <h3>Mode 1 · Legs</h3>
+      <div class="row"><span>Base VRoid model</span><button id="load-base">Choose .vrm…</button></div>
+      <div class="hint" id="base-name">No base model loaded.</div>
+      <label class="row"><span>Match skin colour</span><input type="checkbox" data-setting="matchSkin"></label>
+      <label class="row"><span>Match leg proportions</span><input type="checkbox" data-setting="matchProportions"></label>
+      <label class="row"><span>Hide base model clothing</span><input type="checkbox" data-setting="hideBaseClothing"></label>
+      <label class="row"><span>Show shoes</span><input type="checkbox" data-setting="showShoes"></label>
+      <div class="row"><span>Bottoms library</span><button id="open-bottoms">Open folder</button></div>
+      <div class="hint" id="bottoms-count"></div>
+      <h4>Saved characters <span id="char-count"></span></h4>
+      <div id="char-list"></div>
+      <div class="row">
+        <span>Remove saves loaded fewer than</span>
+        <input type="number" min="1" max="999" step="1" data-setting="cleanupMinLoads" class="small">
+      </div>
+      <div class="row buttons">
+        <button id="cleanup">Clean up</button>
+        <button id="delete-selected">Delete selected</button>
+      </div>
+    </section>
+
+    <section data-mode="mocap">
+      <h3>Mode 2 · Motion capture</h3>
+      <div class="row"><span>Your model</span><button id="load-mocap">Import .vrm…</button></div>
+      <div class="hint" id="mocap-name">No model imported.</div>
+      <label class="row"><span>Follow character</span>
+        <select data-setting="mocapTarget">
+          <option value="largest">Largest on screen</option>
+          <option value="0">Character 1 (left-most)</option>
+          <option value="1">Character 2</option>
+          <option value="2">Character 3</option>
+          <option value="3">Character 4</option>
+        </select>
+      </label>
+      <label class="row"><span>Overlay model on character</span><input type="checkbox" data-setting="mocapFollowCharacter"></label>
+      <label class="row"><span>Record root motion</span><input type="checkbox" data-setting="recordRootMotion"></label>
+      <div class="row buttons">
+        <button id="record">● Record</button>
+        <button id="export" disabled>Export .fbx</button>
+      </div>
+      <div class="hint" id="rec-info">Not recording.</div>
+    </section>
+
+    <footer>
+      <span class="hint">Ctrl+Alt+V menu · Ctrl+Alt+H hide · offline</span>
+      <button id="quit">Quit</button>
+    </footer>
+  </div>
+
+  <div id="toast" hidden></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

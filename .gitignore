@@ -1,0 +1,7 @@
+node_modules/
+dist/
+release/
+assets/models/*.task
+test/fixtures/
+*.log
+test/harness/bundle.js
