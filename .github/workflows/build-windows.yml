@@ -25,7 +25,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: assets/models
-          key: mediapipe-pose-models-v1
+          key: mediapipe-models-v2
 
       - name: Install dependencies
         run: npm ci

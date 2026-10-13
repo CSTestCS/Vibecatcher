@@ -1,7 +1,7 @@
 // Browser test harness: exercises the model pipeline with synthetic landmarks.
 import * as THREE from 'three';
 import { parseVrm, prepareLegsModel, reshapeLegs, measureThighRatio, bakeLegTexture, applyCulling, AvatarInstance } from '../../src/renderer/lib/avatar.js';
-import { applyPose, solvePlacement, placeModel } from '../../src/renderer/lib/retarget.js';
+import { applyPose, solvePlacement, placeModel, alignToScreen } from '../../src/renderer/lib/retarget.js';
 import { MotionRecorder } from '../../src/renderer/lib/recorder.js';
 import { classifyLegwear } from '../../src/renderer/lib/features.js';
 
@@ -73,6 +73,7 @@ window.runTest = async (url, mode) => {
     avatar.vrm.humanoid.update();
     const sol = solvePlacement(avatar.rig, pose.lm2d, pose.lmW, camera, 16 / 9);
     placeModel(avatar.vrm, sol.anchor);
+    if (window.ALIGN) alignToScreen(avatar.rig, pose.lm2d, camera, { legs: true, arms: true, anchor: sol.anchor });
     avatar.vrm.update(1 / 30);
     avatar.setLighting({ dir: [0.6, 0.5, 0.6], color: [1, 0.9, 0.8], intensity: 1.5, ambientColor: [0.3, 0.3, 0.4], ambientIntensity: 0.6, skyColor: [0.8, 0.85, 1] }, 1, true);
     rec.capture(null);

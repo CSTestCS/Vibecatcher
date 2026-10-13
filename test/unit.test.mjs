@@ -121,3 +121,52 @@ test('appearance keys are stable and distances are symmetric', () => {
   assert.ok(appearanceDistance(a, b) < 2);
   assert.equal(appearanceDistance(a, b), appearanceDistance(b, a));
 });
+
+test('One Euro filter removes jitter while still and follows motion', async () => {
+  const { OneEuro } = await import('../src/renderer/lib/filters.js');
+  const f = new OneEuro(1.0, 4);
+  let rnd = 1;
+  const noise = () => { rnd = (rnd * 16807) % 2147483647; return (rnd / 2147483647 - 0.5) * 0.01; };
+  let dev = 0, raw = 0;
+  for (let i = 0; i < 300; i++) {
+    const n = noise();
+    const y = f.filter(0.5 + n, 1 / 30);
+    if (i > 30) { dev += Math.abs(y - 0.5); raw += Math.abs(n); }
+  }
+  assert.ok(dev < raw * 0.4, `still jitter ${dev / 270} vs raw ${raw / 270}`);
+  // a fast move: lag after 10 frames must be small
+  let y = 0;
+  for (let i = 1; i <= 10; i++) y = f.filter(0.5 + i * 0.03, 1 / 30);
+  assert.ok(0.8 - y < 0.05, `lag ${0.8 - y}`);
+});
+
+test('sudden left/right leg label flips are undone', async () => {
+  globalThis.document ??= { createElement: () => ({ getContext: () => ({}) }) };
+  const { fixLabelFlips } = await import('../src/renderer/lib/tracker.js');
+  const pose = () => Array.from({ length: 33 }, (_, i) => ({ x: 0.5, y: i / 40, z: 0, visibility: 1 }));
+  const prev = pose();
+  for (const [l, r] of [[25, 26], [27, 28], [29, 30], [31, 32]]) { prev[l].x = 0.45; prev[r].x = 0.55; }
+  const cur = prev.map((p) => ({ ...p }));
+  for (const [l, r] of [[25, 26], [27, 28], [29, 30], [31, 32]]) { cur[l].x = 0.55; cur[r].x = 0.45; } // labels swapped
+  const curW = cur.map((p) => ({ ...p }));
+  fixLabelFlips(cur, curW, prev, 0.5);
+  assert.equal(cur[25].x, 0.45);
+  assert.equal(cur[26].x, 0.55);
+  // genuine small motion is left alone
+  const moved = prev.map((p) => ({ ...p, x: p.x + 0.001 }));
+  fixLabelFlips(moved, moved.map((p) => ({ ...p })), prev, 0.5);
+  assert.equal(moved[25].x, 0.451);
+});
+
+test('pose jumps (cuts) are told apart from normal motion', async () => {
+  const { poseJumped } = await import('../src/renderer/lib/tracker.js');
+  const pose = () => Array.from({ length: 33 }, (_, i) => ({ x: 0.5 + ((i % 2) ? 0.05 : -0.05), y: i / 40, visibility: 1 }));
+  const prev = pose();
+  const walk = prev.map((p) => ({ ...p, x: p.x + 0.01 })); // whole body moves a bit
+  assert.equal(poseJumped(walk, prev, 0.8), false);
+  // a cut to a different shot of the same spot: the centre stays, but most joints move far
+  const reshot = prev.map((p, i) => (i >= 13 && i !== 23 && i !== 24 ? { ...p, x: p.x + (i % 2 ? 0.2 : -0.2) } : { ...p }));
+  assert.equal(poseJumped(reshot, prev, 0.8), true);
+  const teleport = prev.map((p) => ({ ...p, x: p.x + 0.5 }));
+  assert.equal(poseJumped(teleport, prev, 0.8), true);
+});

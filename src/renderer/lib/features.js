@@ -120,8 +120,19 @@ export function extractAppearance(sampler, lm) {
     const s = sampler.patch(p.x, p.y, patchR);
     if (s) skinSamples.push(s.color);
   }
-  const nose = sampler.patch(lm[LM.nose].x, lm[LM.nose].y, patchR);
+  const faceVisible = vis(lm[LM.nose]) > 0.6 && vis(lm[LM.mouthL]) > 0.5 && vis(lm[LM.mouthR]) > 0.5;
+  if (!faceVisible) skinSamples.length = 0;
+  const nose = faceVisible ? sampler.patch(lm[LM.nose].x, lm[LM.nose].y, patchR) : null;
   if (nose) skinSamples.push(nose.color);
+  if (!skinSamples.length) {
+    // seen from behind / face hidden: use the backs of the hands instead
+    for (const [w, i, p] of [[LM.lWrist, LM.lIndex, LM.lPinky], [LM.rWrist, LM.rIndex, LM.rPinky]]) {
+      if (vis(lm[w]) < 0.6 || vis(lm[i]) < 0.5) continue;
+      const c = lerp2(lm[w], lerp2(lm[i], lm[p], 0.5), 0.5);
+      const s = sampler.patch(c.x, c.y, Math.max(1, patchR - 1));
+      if (s) skinSamples.push(s.color);
+    }
+  }
   const skin = medianColor(skinSamples);
   if (!skin) return null;
   const skinLab = rgbToLab(skin);

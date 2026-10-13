@@ -5,7 +5,12 @@ export const DEFAULT_SETTINGS = {
   maxCharacters: 2,
   displayId: '',
   detectionModel: 'full', // lite | full | heavy
-  minConfidence: 0.5,
+  minConfidence: 0.4, // pose landmarker confidence
+  personModel: 'lite0', // person detector: lite0 (fast) | lite2 (accurate)
+  processing: 'gpu', // pose models on 'gpu' or 'cpu'
+  personThreshold: 0.35,
+  cutSensitivity: 1,
+  alignToScreen: true, // pin model joints onto the on-screen landmarks
   analysisWidth: 640,
   smoothing: 0.5, // 0 = raw, 1 = very smooth
   cameraFov: 50, // vertical FOV in degrees assumed for the game / video camera

@@ -7,10 +7,17 @@ const fs = require('fs');
 const https = require('https');
 
 const dir = path.join(__dirname, '..', 'assets', 'models');
-const MODELS = ['lite', 'full', 'heavy'].map((v) => ({
-  file: `pose_landmarker_${v}.task`,
-  url: `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_${v}/float16/1/pose_landmarker_${v}.task`,
-}));
+const MODELS = [
+  ...['lite', 'full', 'heavy'].map((v) => ({
+    file: `pose_landmarker_${v}.task`,
+    url: `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_${v}/float16/1/pose_landmarker_${v}.task`,
+  })),
+  // person detectors (COCO), used to find characters before pose tracking
+  ...['lite0', 'lite2'].map((v) => ({
+    file: `efficientdet_${v}.tflite`,
+    url: `https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_${v}/float16/1/efficientdet_${v}.tflite`,
+  })),
+];
 
 function download(url, dest, redirects = 5) {
   return new Promise((resolve, reject) => {

@@ -2,13 +2,25 @@
 
 A transparent, always-on-top desktop overlay for Windows. It watches your screen, finds humanoid characters, and draws a VRoid / VRM model over each one. The model is posed to match the character from the same camera angle and lit to match the scene. You keep using your PC normally: the overlay is click-through everywhere except its own gear button and menu.
 
-- **30 fps** loop: screen capture → pose detection → tracking → retargeting → rendering.
+- **30 fps** loop: screen capture → person detection → per-character pose tracking → retargeting → screen alignment → rendering.
 - **Multiple characters**: up to the number you choose ("Max characters at once", 1–8).
 - **Lighting match**: each model gets its own key light (colour, direction, strength) and ambient light, estimated from the pixels of the character it covers.
 - **Invisible 3D environment**: the canvas is fully transparent, so only the models are drawn.
 - **Back-face culling toggle** for the models.
 - **Fully offline**: the pose models and the WASM runtime ship inside the app. Every network request is blocked at the session level and DNS resolution is disabled.
 - **Settings menu** collapses into a small gear. Click the gear to open or close the menu, or drag it to move it anywhere on screen.
+
+## How tracking works
+
+1. **Person detection.** A COCO person detector (EfficientDet) finds every humanoid on screen. Unlike a face-based detector, it also finds characters seen from behind, partly off-screen, small or in front of busy backgrounds.
+2. **Per-character pose tracking.** Each character gets its own pose model, fed a high-resolution crop that follows it, so distant characters get the model's full resolution.
+3. **Cleaning.**
+   - Sudden left/right label swaps (common when legs cross or a character turns) are undone.
+   - Limbs whose length suddenly jumps are treated as unreliable.
+   - Limbs that are hidden or off-screen keep their last pose instead of flailing.
+4. **Smoothing.** Every landmark and the model's placement go through a One-Euro filter: strong smoothing when still (no shaking), low lag when moving.
+5. **Camera cuts** are detected. Smoothing is reset so the pose snaps to the new shot instead of sliding across it, and characters are re-identified. A character whose legs were already built gets them back instantly.
+6. **Pin limbs to the character** (on by default). After the 3D pose is applied, each joint (hips, knees, ankles, feet, and arms in mode 2) is re-aimed so that it lands exactly on the character's joint on screen. Depth comes from the 3D pose. This is what makes the legs sit on the character like a skin.
 
 ## Modes
 
@@ -17,7 +29,7 @@ A transparent, always-on-top desktop overlay for Windows. It watches your screen
 Pick a **base VRoid model** (`.vrm` exported from VRoid Studio). For every detected character, Vibecatcher:
 
 1. Loads the full VRoid skeleton but **shows only the waist-down** part of the mesh. The face, hair, upper body and (optionally) the base model's own clothing are removed.
-2. **Matches skin colour** by sampling the character's face and tinting the body texture.
+2. **Matches skin colour** by sampling the character's face (or hands, when seen from behind) and tinting the body texture.
 3. **Matches leg proportions**: thigh and shin length relative to the torso, and thigh thickness when a segmentation mask is available. The legs are reshaped in the rest pose and re-bound, so they still bend cleanly.
 4. **Classifies the leg wear** (pants, capris, shorts, short shorts, skirt, mini, midi, long skirt, socks, knee socks or thigh-highs). It picks the matching texture from **your bottoms folder**, recolours it with the average colour the character is wearing, and lays it over the skin texture using the model's UV layout.
 5. Saves a **character key** built from skin tone, hair colour and length, top colour, bottom colour and leg-wear type, together with the bottoms that were chosen. When the same character returns (even after leaving the screen), it gets the same legs.
@@ -51,7 +63,11 @@ Tips:
 
 - **Camera FOV** should roughly match the game's field of view. It controls how depth and perspective are solved.
 - **Show detected skeleton** draws the detected landmarks, which helps when tuning.
-- Use **Lite** detection for speed and **Heavy** for accuracy.
+- **Motion smoothing**: higher = steadier but slightly more lag.
+- **Detection model** (pose): **Lite** for speed, **Full** (default) or **Heavy** for accuracy. **Person detector**: **Fast** (default) or **Accurate**.
+- **Person confidence / Pose confidence**: lower them if characters are missed, raise them if things that aren't characters get picked up.
+- **Camera-cut sensitivity**: raise it if cuts are missed (poses slide between shots), lower it if fast camera pans are treated as cuts.
+- **Pose processing**: GPU (default) or CPU, for PCs where GPU acceleration misbehaves.
 
 ## Bottoms textures
 
@@ -96,11 +112,12 @@ npm test           # unit tests (FBX writer, leg-wear classifier, bottoms picker
 npm run dist       # Windows .exe (run on Windows, or let CI do it)
 ```
 
-For development, `VIBE_TEST_SOURCE=path/to/image.jpg npm start` feeds a still image instead of the screen. `test/harness/` is a browser harness that exercises model loading, the legs pipeline, retargeting and FBX export against a sample VRM.
+For development, `VIBE_TEST_SOURCE=path/to/image.jpg` (or a `.mp4` video, stepped exactly one frame per processed frame) feeds that instead of the screen. `VIBE_DEBUG=1` logs tracking metrics (joint alignment error and jitter in pixels, cuts, timings) to the console. `test/harness/` is a browser harness that exercises model loading, the legs pipeline, retargeting and FBX export against a sample VRM.
 
 ## Notes and limitations
 
-- Pose detection uses MediaPipe Pose Landmarker, which is trained on real people. It works well on realistic and semi-realistic 3D characters. Heavily stylised or chibi characters may be detected less reliably.
+- The detectors (MediaPipe Pose Landmarker and EfficientDet) are trained on real people. They work well on realistic and semi-realistic 3D characters. Heavily stylised or chibi characters may be detected less reliably.
+- The pose model needs to see enough of the body to place the joints. When only part of a character is visible, the visible limbs are tracked, and hidden ones keep their last pose.
 - The overlay excludes itself from screen capture (Windows 10 2004+) so it never detects its own models. A side effect is that it also won't show up in your own screenshots or recordings.
 - The models are drawn over the screen. They don't know what in the game scene is in front of the character, so they are never hidden behind scene objects.
 - `.vrn` files are accepted in the file picker as well as `.vrm` / `.glb`.

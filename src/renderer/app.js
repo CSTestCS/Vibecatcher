@@ -3,8 +3,10 @@
 import * as THREE from 'three';
 import { mergeSettings } from './lib/settings.js';
 import { OverlayUI } from './ui.js';
-import { PoseDetector } from './lib/detector.js';
+import { PersonDetector, PosePool } from './lib/detector.js';
 import { Tracker } from './lib/tracker.js';
+import { SceneCutDetector } from './lib/scenecut.js';
+import { OneEuro } from './lib/filters.js';
 import { CharacterStore } from './lib/characters.js';
 import {
   FrameSampler, extractAppearance, extractProportions, estimateLighting, averageAppearance, LM,
@@ -13,19 +15,25 @@ import { parseBottomFile, chooseBottoms, loadBottomImage } from './lib/bottoms.j
 import {
   parseVrm, prepareLegsModel, reshapeLegs, measureThighRatio, bakeLegTexture, applyCulling, AvatarInstance,
 } from './lib/avatar.js';
-import { applyPose, solvePlacement, placeModel } from './lib/retarget.js';
+import { applyPose, solvePlacement, placeModel, alignToScreen } from './lib/retarget.js';
 import { MotionRecorder } from './lib/recorder.js';
 
 const api = window.vibe;
 const FPS = 30;
 const FRAME_MS = 1000 / FPS;
-const APPEARANCE_SAMPLES = 6;
+const APPEARANCE_SAMPLES = 6; // samples needed to create a new character save
+const QUICK_MATCH_SAMPLES = 2; // samples needed to recognise a saved character
+const AVATAR_CACHE = 6; // built leg models kept for characters that left the screen
+const params = new URLSearchParams(location.search);
+const DEBUG = params.get('debug') === '1';
 
 const state = {
   settings: null,
   ui: null,
-  detector: new PoseDetector(),
-  tracker: new Tracker(),
+  persons: new PersonDetector(),
+  posePool: new PosePool(),
+  tracker: null,
+  sceneCut: null,
   store: null,
   recorder: new MotionRecorder(),
   video: null,
@@ -36,6 +44,8 @@ const state = {
   mocapAvatar: null,
   mocapLoading: false,
   avatars: new Map(), // trackId -> AvatarInstance
+  avatarCache: new Map(), // characterId -> AvatarInstance (hidden, ready to reuse)
+  metrics: { align: 0, jitter: 0, n: 0, cuts: 0 },
   pending: new Set(), // trackIds with an avatar being built
   freeLayers: Array.from({ length: 30 }, (_, i) => i + 1),
   bottoms: [], // parsed texture files from the bottoms folder
@@ -82,7 +92,20 @@ resize();
 async function startCapture() {
   stopCapture();
   // Development hook: ?testSource=<vibe:// image> replaces screen capture with a still image.
-  const test = new URLSearchParams(location.search).get('testSource');
+  const test = params.get('testSource');
+  if (test && /\.(mp4|webm|mkv)$/i.test(test)) {
+    const v = document.createElement('video');
+    v.muted = true; v.loop = true; v.src = test;
+    await v.play();
+    // slow the test video down to the processing speed so every part of it is
+    // seen at an effective 30 fps, even on slow machines
+    state.testVideo = v;
+    state.testVideoTime = 0;
+    document.body.prepend(v);
+    Object.assign(v.style, { position: 'fixed', inset: '0', width: '100vw', height: '100vh', objectFit: 'fill', zIndex: '-1' });
+    state.video = { el: v, get videoWidth() { return v.videoWidth; }, get videoHeight() { return v.videoHeight; } };
+    return;
+  }
   if (test) {
     const img = new Image();
     img.src = test;
@@ -113,11 +136,11 @@ function stopCapture() {
 async function initDetector() {
   state.detectorReady = false;
   try {
-    await state.detector.init({
-      variant: state.settings.detectionModel,
-      numPoses: state.settings.maxCharacters,
-      minConfidence: state.settings.minConfidence,
-    });
+    const s = state.settings;
+    if (state.tracker) state.tracker.reset(state.posePool);
+    const poseDelegate = s.processing === 'cpu' ? 'CPU' : 'GPU';
+    await state.persons.init({ variant: s.personModel, threshold: s.personThreshold, maxResults: s.maxCharacters * 2 + 2, delegate: 'CPU' });
+    await state.posePool.init({ variant: s.detectionModel, count: s.maxCharacters, minConfidence: s.minConfidence, delegate: poseDelegate });
     state.detectorReady = true;
     state.error = '';
   } catch (e) {
@@ -167,12 +190,43 @@ function ensureBottoms(c) {
 function takeLayer() { return state.freeLayers.shift() ?? 31; }
 function releaseLayer(l) { if (l < 31) state.freeLayers.push(l); }
 
+function destroyAvatar(a) {
+  a.dispose();
+  releaseLayer(a.layer);
+}
+
 function disposeAvatar(trackId) {
   const a = state.avatars.get(trackId);
   if (!a) return;
-  a.dispose();
-  releaseLayer(a.layer);
   state.avatars.delete(trackId);
+  retireAvatar(a);
+}
+
+function retireAvatar(a) {
+  a.group.visible = false;
+  // Keep leg models of known characters so they reappear instantly (e.g. after a camera cut).
+  if (a.characterId && a.baseName === (state.baseVrm && state.baseVrm.name)) {
+    const old = state.avatarCache.get(a.characterId);
+    if (old && old !== a) destroyAvatar(old);
+    state.avatarCache.delete(a.characterId);
+    state.avatarCache.set(a.characterId, a);
+    while (state.avatarCache.size > AVATAR_CACHE) {
+      const [k, v] = state.avatarCache.entries().next().value;
+      state.avatarCache.delete(k);
+      destroyAvatar(v);
+    }
+  } else destroyAvatar(a);
+}
+
+function clearAvatarCache() {
+  for (const a of state.avatarCache.values()) destroyAvatar(a);
+  state.avatarCache.clear();
+}
+
+/** Drops every leg model (live and cached) so they are rebuilt with new options. */
+function rebuildLegs() {
+  for (const id of [...state.avatars.keys()]) { const a = state.avatars.get(id); state.avatars.delete(id); destroyAvatar(a); }
+  clearAvatarCache();
 }
 
 function disposeAllAvatars() {
@@ -183,6 +237,12 @@ function disposeAllAvatars() {
 /** Builds the leg model for a resolved character. */
 async function buildLegsAvatar(track) {
   if (!state.baseVrm || state.pending.has(track.id)) return;
+  const cached = state.avatarCache.get(track.character.id);
+  if (cached) {
+    state.avatarCache.delete(track.character.id);
+    state.avatars.set(track.id, cached);
+    return;
+  }
   state.pending.add(track.id);
   try {
     const c = track.character;
@@ -190,7 +250,6 @@ async function buildLegsAvatar(track) {
     const { skinMeshes, legSets } = prepareLegsModel(vrm, state.settings);
     if (state.settings.matchProportions && c.proportions) reshapeLegs(vrm, legSets, c.proportions);
     const avatar = new AvatarInstance(vrm, takeLayer());
-    if (state.tracker.tracks.find((t) => t.id === track.id) === undefined) { avatar.dispose(); releaseLayer(avatar.layer); return; }
     ensureBottoms(c);
     const layers = [];
     for (const [id, color] of [[c.bottomId, c.colors.bottom], [c.legwearId, c.colors.socks || c.colors.bottom]]) {
@@ -202,7 +261,11 @@ async function buildLegsAvatar(track) {
     }
     bakeLegTexture(skinMeshes, { skin: state.settings.matchSkin ? c.colors.skin : null, layers }, avatar.rest);
     applyCulling(vrm, state.settings.backfaceCulling);
+    avatar.characterId = c.id;
+    avatar.baseName = state.baseVrm.name;
     scene.add(avatar.group);
+    // the character left while its legs were being built: keep them for later
+    if (!state.tracker.tracks.find((t) => t.id === track.id)) { retireAvatar(avatar); return; }
     disposeAvatar(track.id);
     state.avatars.set(track.id, avatar);
   } catch (e) {
@@ -234,9 +297,10 @@ async function buildMocapAvatar() {
 // ---------------------------------------------------------------------------
 // Character identification (mode 1)
 // ---------------------------------------------------------------------------
-function resolveCharacter(track) {
+function resolveCharacter(track, allowCreate = true) {
   const appearance = averageAppearance(track.samples);
   let c = state.store.match(appearance);
+  if (!c && !allowCreate) return;
   if (!c) {
     const prop = averageProportions(track.propSamples);
     const pick = chooseBottoms(appearance.legwear, state.bottoms);
@@ -295,16 +359,13 @@ async function loadBaseFromBuffer(file) {
     return;
   }
   for (const c of state.store.list) if (c.proportions) c.proportions.fitted = null;
-  for (const id of [...state.avatars.keys()]) disposeAvatar(id);
+  rebuildLegs();
 }
 
 // ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
-function selectTracks(tracks) {
-  const size = (t) => Math.hypot(t.lm2d[LM.lShoulder].x - t.lm2d[LM.lAnkle].x, t.lm2d[LM.lShoulder].y - t.lm2d[LM.lAnkle].y);
-  return [...tracks].sort((a, b) => size(b) - size(a)).slice(0, state.settings.maxCharacters);
-}
+function boxArea(t) { return t.box.w * t.box.h; }
 
 function frameMean(img) {
   const d = img.data;
@@ -313,16 +374,33 @@ function frameMean(img) {
   return n ? [r / n, g / n, b / n] : null;
 }
 
-function poseAvatar(avatar, track, dt, follow = true) {
+/** One-Euro filtered model placement (stops size / depth pumping). */
+function filteredAnchor(track, anchor, dt) {
+  const s = state.settings;
+  if (!track.anchorF || track.resetPlacement) {
+    const c = 0.25 + 2.0 * (1 - s.smoothing);
+    track.anchorF = [new OneEuro(c, 1.5), new OneEuro(c, 1.5), new OneEuro(c * 0.5, 0.6)];
+    track.resetPlacement = false;
+  }
+  const [fx, fy, fz] = track.anchorF;
+  // filter depth, then keep the anchor exactly on the hip landmark's camera ray
+  const z = fz.filter(anchor.z, dt);
+  const x = fx.filter(anchor.x / anchor.z, dt), y = fy.filter(anchor.y / anchor.z, dt);
+  return new THREE.Vector3(x * z, y * z, z);
+}
+
+function poseAvatar(avatar, track, dt, { follow = true, mode }) {
+  const s = state.settings;
   applyPose(avatar.rig, track.lmW);
   avatar.vrm.humanoid.update();
   if (follow) {
     const sol = solvePlacement(avatar.rig, track.lm2d, track.lmW, camera, camera.aspect);
-    if (sol) {
-      // smooth depth to avoid size popping
-      if (track.anchor) sol.anchor.lerp(track.anchor, Math.min(0.8, state.settings.smoothing));
-      track.anchor = sol.anchor.clone();
-      placeModel(avatar.vrm, sol.anchor);
+    if (sol) track.anchor = filteredAnchor(track, sol.anchor, dt);
+    if (track.anchor) {
+      placeModel(avatar.vrm, track.anchor);
+      if (s.alignToScreen) {
+        alignToScreen(avatar.rig, track.lm2d, camera, { legs: true, arms: mode === 'mocap', hips: true, anchor: track.anchor });
+      }
     }
   } else {
     // fixed preview position in the lower-right corner
@@ -332,11 +410,62 @@ function poseAvatar(avatar, track, dt, follow = true) {
   }
   avatar.vrm.update(dt);
   avatar.group.visible = true;
+  if (DEBUG && follow) measureAlignment(avatar, track);
 }
 
+// Debug metrics: screen distance between model joints and landmarks, and
+// frame-to-frame jitter of the model's projected joints (pixels).
+function measureAlignment(avatar, track) {
+  const h = avatar.vrm.humanoid;
+  const W = window.innerWidth, H = window.innerHeight;
+  const joints = [['leftLowerLeg', LM.lKnee], ['rightLowerLeg', LM.rKnee], ['leftFoot', LM.lAnkle], ['rightFoot', LM.rAnkle]];
+  const cur = [];
+  let err = 0, n = 0;
+  for (const [bone, lmi] of joints) {
+    const p = h.getRawBoneNode(bone).getWorldPosition(new THREE.Vector3()).project(camera);
+    const px = { x: (p.x + 1) / 2 * W, y: (1 - p.y) / 2 * H };
+    cur.push(px);
+    if ((track.lm2d[lmi].visibility ?? 1) < 0.5) continue;
+    err += Math.hypot(px.x - track.lm2d[lmi].x * W, px.y - track.lm2d[lmi].y * H); n++;
+  }
+  const m = state.metrics;
+  if (n) { m.align += err / n; m.n++; }
+  if (n && err / n > 2 && DEBUG) {
+    const v = [LM.lKnee, LM.rKnee, LM.lAnkle, LM.rAnkle].map((i) => (track.lm2d[i].visibility ?? 1).toFixed(2)).join(',');
+    console.info(`[align] frame=${state.frame} err=${(err / n).toFixed(1)} vis=${v} joints=${n}`);
+  }
+  if (track.lastJoints) {
+    let j = 0;
+    cur.forEach((p, i) => { j += Math.hypot(p.x - track.lastJoints[i].x, p.y - track.lastJoints[i].y); });
+    m.jitter += j / cur.length;
+  }
+  track.lastJoints = cur;
+}
+
+// The loop must survive any single bad frame.
 function tick() {
   const now = performance.now();
-  const dt = Math.min(0.1, clock.getDelta());
+  try {
+    frame(now);
+  } catch (e) {
+    console.error('[frame error]', e && e.stack ? e.stack : e);
+    state.error = `Frame error: ${e.message}`;
+  }
+  const spent = performance.now() - now;
+  setTimeout(tick, Math.max(0, FRAME_MS - spent));
+}
+
+function frame(now) {
+  let dt = Math.min(0.1, clock.getDelta());
+  if (state.testVideo) {
+    const v = state.testVideo;
+    const rate = Math.min(1, Math.max(1 / 16, state.fps / FPS));
+    if (Math.abs(v.playbackRate - rate) > 0.02) v.playbackRate = rate;
+    let vdt = v.currentTime - state.testVideoTime;
+    if (vdt < 0) vdt += v.duration; // looped
+    state.testVideoTime = v.currentTime;
+    dt = Math.min(0.1, Math.max(1 / 240, vdt));
+  }
   state.fps = state.fps * 0.9 + (1000 / Math.max(1, now - state.lastTick)) * 0.1;
   state.lastTick = now;
   state.frame++;
@@ -358,42 +487,60 @@ function tick() {
     const actx = an.getContext('2d', { willReadFrequently: true });
     actx.drawImage(video.el, 0, 0, aw, ah);
 
-    const needAppearance = s.mode === 'legs' && state.tracker.tracks.some((t) => !t.character && t.samples.length < APPEARANCE_SAMPLES);
+    const T0 = performance.now();
+    const cut = state.sceneCut.check(an, state.frame, s.cutSensitivity);
+    if (cut) state.metrics.cuts++;
+    // Person detection finds new characters and re-anchors tracks. Tracks are
+    // followed by their pose models in between, so it runs every few frames,
+    // and immediately after a cut or while looking for more characters.
+    const tracked = state.tracker.tracks.filter((t) => t.missing === 0).length;
+    const runDet = cut || tracked === 0 || state.frame % (tracked < s.maxCharacters ? 3 : 6) === 0;
+    const dets = runDet ? state.persons.detect(an) : null;
+    if (dets) state.lastDets = dets.map((d) => `${d.score.toFixed(2)}@${(d.w * d.h).toFixed(3)}`).join('|');
+    const T1 = performance.now();
     const lightingTick = s.matchLighting && state.frame % 10 === 0;
-    const wantPixels = needAppearance || lightingTick;
-    const poses = state.detector.detect(an, wantPixels);
-    active = selectTracks(state.tracker.update(poses, s.smoothing));
-    for (const t of state.tracker.dropped) { disposeAvatar(t.id); }
-
-    let img = null, mean = null;
-    if (wantPixels && active.length) { img = actx.getImageData(0, 0, aw, ah); mean = frameMean(img); }
+    const needsAppearance = (t) => s.mode === 'legs' && !t.character && t.samples.length < APPEARANCE_SAMPLES;
+    active = state.tracker.step({
+      video, dets, cut, pool: state.posePool, dt, smoothing: s.smoothing,
+      wantPixels: (t) => needsAppearance(t) || lightingTick || !t.lighting,
+      maxTracks: s.maxCharacters,
+    }).sort((a, b) => boxArea(b) - boxArea(a)).slice(0, s.maxCharacters);
+    for (const t of state.tracker.takeDropped()) disposeAvatar(t.id);
+    const T2 = performance.now();
+    if (DEBUG) { state.metrics.tDet = (state.metrics.tDet || 0) + T1 - T0; state.metrics.tPose = (state.metrics.tPose || 0) + T2 - T1; state.metrics.frames = (state.metrics.frames || 0) + 1; }
 
     for (const track of active) {
-      const pose = poses[track.poseIndex];
-      const sampler = img ? new FrameSampler(img, pose && pose.mask) : null;
-      if (sampler) sampler.validateMask(pose.lm2d);
-
-      if (sampler && lightingTick) {
-        const est = estimateLighting(sampler, pose.lm2d, mean);
+      // appearance / lighting are sampled on the track's high-resolution crop
+      let sampler = null;
+      if (track.cropImage && track.cropLm) {
+        sampler = new FrameSampler(track.cropImage, track.cropMask);
+        sampler.validateMask(track.cropLm);
+      }
+      if (sampler && (lightingTick || !track.lighting)) {
+        const est = estimateLighting(sampler, track.cropLm, frameMean(track.cropImage));
         if (est) track.lighting = track.lighting ? blendLight(track.lighting, est) : est;
       }
 
       if (s.mode === 'legs') {
         if (!track.character) {
-          if (sampler && track.age >= 3 && track.samples.length < APPEARANCE_SAMPLES) {
-            const a = extractAppearance(sampler, pose.lm2d);
-                        if (a) track.samples.push(a);
-            track.propSamples.push(extractProportions(sampler, pose.lm2d, pose.lmW));
+          if (sampler && track.poseFrames >= 3 && track.samples.length < APPEARANCE_SAMPLES) {
+            const a = extractAppearance(sampler, track.cropLm);
+            if (a) {
+              track.samples.push(a);
+              track.propSamples.push(extractProportions(sampler, track.cropLm, track.lmW));
+            }
           }
-          if (track.samples.length >= APPEARANCE_SAMPLES && state.baseVrm) {
-            resolveCharacter(track);
-            fitProportions(track.character);
+          if (state.baseVrm && track.samples.length >= QUICK_MATCH_SAMPLES) {
+            // a saved character is recognised from a couple of samples; a new
+            // one waits for enough samples to describe it reliably
+            resolveCharacter(track, track.samples.length >= APPEARANCE_SAMPLES);
+            if (track.character) fitProportions(track.character);
           }
         }
         if (track.character && !state.avatars.has(track.id)) buildLegsAvatar(track);
         const avatar = state.avatars.get(track.id);
         if (avatar) {
-          poseAvatar(avatar, track, dt);
+          poseAvatar(avatar, track, dt, { mode: 'legs' });
           avatar.setLighting(track.lighting, s.lightingStrength, s.matchLighting);
         }
       }
@@ -404,7 +551,8 @@ function tick() {
       const target = mocapTarget(active);
       const av = state.mocapAvatar;
       if (target) {
-        poseAvatar(av, target, dt, s.mocapFollowCharacter);
+        if (state.mocapTrackId !== target.id) { state.mocapTrackId = target.id; target.resetPlacement = true; }
+        poseAvatar(av, target, dt, { follow: s.mocapFollowCharacter, mode: 'mocap' });
         av.setLighting(target.lighting, s.lightingStrength, s.matchLighting);
         if (state.recorder.recording) {
           let root = null;
@@ -434,8 +582,12 @@ function tick() {
   if (state.mocapAvatar) draw(state.mocapAvatar);
 
   if (state.frame % 15 === 0) updateStatus(active.length);
-  const spent = performance.now() - now;
-  setTimeout(tick, Math.max(0, FRAME_MS - spent));
+  if (DEBUG && state.frame % 15 === 0) {
+    const m = state.metrics;
+    const vt = state.video && state.video.el.currentTime !== undefined ? ` t=${state.video.el.currentTime.toFixed(1)}` : '';
+    console.info(`[metrics]${vt} tracks=${active.length} all=${state.tracker.tracks.map((t) => `#${t.id}:pf${t.poseFrames}/m${t.missing}/nd${t.noDet}/${t.character ? 'C' : 's' + t.samples.length}`).join(',')} dets=${state.lastDets} align_px=${m.n ? (m.align / m.n).toFixed(2) : '-'} jitter_px=${m.n ? (m.jitter / m.n).toFixed(2) : '-'} cuts=${m.cuts} frames=${m.frames || 0} det_ms=${m.frames ? (m.tDet / m.frames).toFixed(0) : '-'} pose_ms=${m.frames ? (m.tPose / m.frames).toFixed(0) : '-'} total_ms=${(performance.now() - now).toFixed(0)}`);
+    state.metrics = { align: 0, jitter: 0, n: 0, cuts: 0 };
+  }
 }
 
 function blendLight(a, b) {
@@ -450,7 +602,11 @@ function blendLight(a, b) {
 function mocapTarget(active) {
   if (!active.length) return null;
   const t = state.settings.mocapTarget;
-  if (t === 'largest') return active[0];
+  if (t === 'largest') {
+    // stay on the current character unless another is clearly larger
+    const cur = active.find((a) => a.id === state.mocapTrackId);
+    return cur && boxArea(cur) > boxArea(active[0]) * 0.6 ? cur : active[0];
+  }
   const byX = [...active].sort((a, b) => a.lm2d[LM.lHip].x - b.lm2d[LM.lHip].x);
   return byX[Number(t)] || null;
 }
@@ -493,18 +649,16 @@ function updateStatus(n) {
 // ---------------------------------------------------------------------------
 function onSettingsChanged(key) {
   const s = state.settings;
-  if (['detectionModel', 'maxCharacters', 'minConfidence'].includes(key)) initDetector();
+  if (['detectionModel', 'maxCharacters', 'minConfidence', 'personModel', 'personThreshold', 'processing'].includes(key)) initDetector();
   if (key === 'displayId') setTimeout(startCapture, 300);
   if (key === 'backfaceCulling') {
     for (const a of state.avatars.values()) applyCulling(a.vrm, s.backfaceCulling);
     if (state.mocapAvatar) applyCulling(state.mocapAvatar.vrm, s.backfaceCulling);
   }
-  if (['hideBaseClothing', 'showShoes', 'matchSkin', 'matchProportions'].includes(key)) {
-    for (const id of [...state.avatars.keys()]) disposeAvatar(id);
-  }
+  if (['hideBaseClothing', 'showShoes', 'matchSkin', 'matchProportions'].includes(key)) rebuildLegs();
   if (key === 'mode') {
     if (state.recorder.recording) toggleRecord();
-    if (s.mode === 'mocap') for (const id of [...state.avatars.keys()]) disposeAvatar(id);
+    if (s.mode === 'mocap') rebuildLegs();
   }
 }
 
@@ -560,7 +714,7 @@ function bindButtons() {
   document.getElementById('reload-bottoms').addEventListener('click', async () => {
     await loadBottoms();
     // rebuild the legs so new / changed textures show up
-    for (const id of [...state.avatars.keys()]) disposeAvatar(id);
+    rebuildLegs();
     state.ui.toast('Bottoms library reloaded.');
   });
   document.getElementById('cleanup').addEventListener('click', () => {
@@ -580,6 +734,8 @@ function bindButtons() {
 // ---------------------------------------------------------------------------
 async function main() {
   state.settings = mergeSettings(await api.getSettings());
+  state.tracker = new Tracker();
+  state.sceneCut = new SceneCutDetector();
   state.ui = new OverlayUI({ api, settings: state.settings, onSettingsChanged });
   state.ui.setDisplays(await api.listDisplays());
   state.store = new CharacterStore(api);

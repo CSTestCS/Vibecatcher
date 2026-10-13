@@ -35,7 +35,8 @@ protocol.registerSchemesAsPrivileged([{
 const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css',
   '.json': 'application/json', '.wasm': 'application/wasm', '.png': 'image/png', '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg', '.task': 'application/octet-stream', '.map': 'application/json', '.svg': 'image/svg+xml',
+  '.jpeg': 'image/jpeg', '.task': 'application/octet-stream', '.tflite': 'application/octet-stream',
+  '.mp4': 'video/mp4', '.webm': 'video/webm', '.map': 'application/json', '.svg': 'image/svg+xml',
 };
 
 // vibe://app/<path>   -> files bundled with the application
@@ -111,8 +112,12 @@ function createOverlay() {
   overlay.setContentProtection(true);
   overlay.setIgnoreMouseEvents(true, { forward: true });
   // VIBE_TEST_SOURCE (development only) feeds a still image instead of the screen.
-  const test = process.env.VIBE_TEST_SOURCE ? `?testSource=${encodeURIComponent(`${SCHEME}://app/${process.env.VIBE_TEST_SOURCE}`)}` : '';
-  overlay.loadURL(`${SCHEME}://app/dist/renderer/index.html${test}`);
+  // VIBE_DEBUG=1 (development only) logs tracking metrics to the console.
+  const q = new URLSearchParams();
+  if (process.env.VIBE_TEST_SOURCE) q.set('testSource', `${SCHEME}://app/${process.env.VIBE_TEST_SOURCE}`);
+  if (process.env.VIBE_DEBUG) q.set('debug', '1');
+  const qs = q.toString();
+  overlay.loadURL(`${SCHEME}://app/dist/renderer/index.html${qs ? `?${qs}` : ''}`);
   overlay.once('ready-to-show', () => overlay.showInactive());
   overlay.on('closed', () => { overlay = null; });
   // Never open new windows / navigate away.

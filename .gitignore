@@ -1,7 +1,7 @@
 node_modules/
 dist/
 release/
-assets/models/*.task
+assets/models/
 test/fixtures/
 *.log
 test/harness/bundle.js
